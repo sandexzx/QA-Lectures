@@ -471,8 +471,17 @@ async def analyze_user_answer(message: Message, user_id: str, question: str, con
                 {"role": "user", "content": conversation_history[0]["content"]}
             ]
         else:
-            # Для продолжающегося диалога используем историю сообщений
-            messages = conversation_history.copy()
+            # Для продолжающегося диалога добавляем системный промпт с контекстом лекции
+            system_prompt = f"""Ты - опытный преподаватель и наставник по QA/тестированию. Ученик отвечает на вопрос по материалу лекций.
+
+Материал лекций:
+{lecture_content}
+
+Вопрос: {question}
+
+Продолжай диалог в роли учителя, основываясь на материале лекций."""
+            
+            messages = [{"role": "system", "content": system_prompt}] + conversation_history.copy()
         
         completion = client.chat.completions.create(
             model=selected_model,
