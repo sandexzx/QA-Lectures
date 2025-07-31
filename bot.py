@@ -62,7 +62,8 @@ class UserDataManager:
             self.data[user_id] = {
                 "max_lecture": None,
                 "interview_active": False,
-                "asked_questions": []
+                "asked_questions": [],
+                "ai_model": "gemini-2.5-flash"
             }
         return self.data[user_id]
     
@@ -149,6 +150,7 @@ def get_main_menu():
 def get_settings_menu():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📚 Выбрать последнюю лекцию", callback_data="select_lecture")],
+        [InlineKeyboardButton(text="🤖 Выбрать AI модель", callback_data="select_model")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
     ])
     return keyboard
@@ -160,6 +162,25 @@ def get_lecture_selection_keyboard():
         button_text = f"{lecture['number']}. {lecture['title']}"
         callback_data = f"lecture_{lecture['number']}"
         keyboard.append([InlineKeyboardButton(text=button_text, callback_data=callback_data)])
+    
+    keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="settings")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+# Генерация клавиатуры для выбора AI модели
+def get_model_selection_keyboard():
+    models = [
+        ("gpt-4.1", "GPT-4.1"),
+        ("claude-sonnet-4-all", "Claude Sonnet 4 All"),
+        ("o3-mini", "O3 Mini"),
+        ("o4-mini", "O4 Mini"),
+        ("gemini-2.5-flash-lite-preview-06-17", "Gemini 2.5 Flash Lite Preview"),
+        ("gemini-2.5-flash", "Gemini 2.5 Flash")
+    ]
+    
+    keyboard = []
+    for model_code, model_name in models:
+        callback_data = f"model_{model_code}"
+        keyboard.append([InlineKeyboardButton(text=model_name, callback_data=callback_data)])
     
     keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="settings")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
@@ -179,7 +200,8 @@ async def settings_callback(callback: CallbackQuery):
     user_data = user_manager.get_user_data(user_id)
     
     current_lecture = user_data.get("max_lecture", "Не выбрана")
-    text = f"⚙️ Настройки\n\nТекущая последняя лекция: {current_lecture}"
+    current_model = user_data.get("ai_model", "gemini-2.5-flash")
+    text = f"⚙️ Настройки\n\nТекущая последняя лекция: {current_lecture}\nТекущая AI модель: {current_model}"
     
     await callback.message.edit_text(text, reply_markup=get_settings_menu())
 
@@ -203,6 +225,25 @@ async def lecture_selected_callback(callback: CallbackQuery, state: FSMContext):
         reply_markup=get_settings_menu()
     )
     await state.clear()
+
+@dp.callback_query(F.data == "select_model")
+async def select_model_callback(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🤖 Выберите AI модель:",
+        reply_markup=get_model_selection_keyboard()
+    )
+
+@dp.callback_query(F.data.startswith("model_"))
+async def model_selected_callback(callback: CallbackQuery):
+    model_code = callback.data.replace("model_", "")
+    user_id = str(callback.from_user.id)
+    
+    user_manager.update_user_data(user_id, ai_model=model_code)
+    
+    await callback.message.edit_text(
+        f"✅ AI модель установлена: {model_code}",
+        reply_markup=get_settings_menu()
+    )
 
 @dp.callback_query(F.data == "back_to_main")
 async def back_to_main_callback(callback: CallbackQuery):
@@ -270,11 +311,8 @@ async def generate_and_send_question(message: Message, user_id: str, state: FSMC
             asked_questions_text = f"\n\nРанее заданные вопросы (НЕ повторяй их):\n" + "\n".join(asked_questions[-5:])  # Последние 5 вопросов
         
         question_types = [
-            "практический вопрос с примером из реальной работы",
             "вопрос на понимание теоретических основ",
-            "вопрос о применении методологий на практике",
-            "вопрос про инструменты и их использование",
-            "ситуационный вопрос с разбором кейса"
+            "вопрос про инструменты и их использование"
         ]
         
         question_type = random.choice(question_types)
@@ -294,13 +332,17 @@ async def generate_and_send_question(message: Message, user_id: str, state: FSMC
 - Быть сформулированным как на реальном собеседовании
 - Не должен быть слишком простым или слишком сложным
 - Один конкретный вопрос, не список вопросов
+- ВАЖНО: Не выходи за пределы материала лекций
 - ВАЖНО: Не повторяй ранее заданные вопросы!
 - Можешь указать контекст: "В рамках работы QA-инженера..." или "При тестировании..."
 
 Сгенерируй только вопрос, без дополнительных пояснений."""
 
+        user_data = user_manager.get_user_data(user_id)
+        selected_model = user_data.get("ai_model", "gemini-2.5-flash")
+        
         completion = client.chat.completions.create(
-            model="gemini-2.5-flash",
+            model=selected_model,
             messages=[
                 {"role": "user", "content": prompt}
             ],
@@ -337,7 +379,7 @@ async def generate_and_send_question(message: Message, user_id: str, state: FSMC
         
         await message.answer(f"❓ **Вопрос для собеседования:**\n\n{lectures_info}{question}", reply_markup=keyboard)
         await state.set_state(UserStates.waiting_for_answer)
-        await state.update_data(last_question=question, lecture_content=all_content)
+        await state.update_data(last_question=question, lecture_content=all_content, conversation_history=[])
         
     except Exception as e:
         logger.error(f"Ошибка генерации вопроса: {e}")
@@ -374,26 +416,33 @@ async def handle_answer(message: Message, state: FSMContext):
     # Получаем данные о последнем вопросе из состояния
     state_data = await state.get_data()
     last_question = state_data.get("last_question", "")
+    conversation_history = state_data.get("conversation_history", [])
     
     await message.answer("🤔 Анализирую ваш ответ...")
     
+    # Добавляем новый ответ пользователя в историю
+    conversation_history.append({"role": "user", "content": message.text})
+    await state.update_data(conversation_history=conversation_history)
+    
     # Анализируем ответ пользователя
-    await analyze_user_answer(message, user_id, last_question, message.text, state)
+    await analyze_user_answer(message, user_id, last_question, conversation_history, state)
 
-async def analyze_user_answer(message: Message, user_id: str, question: str, answer: str, state: FSMContext):
+async def analyze_user_answer(message: Message, user_id: str, question: str, conversation_history: list, state: FSMContext):
     state_data = await state.get_data()
     lecture_content = state_data.get("lecture_content", "")
     
     try:
-        # Создаем промпт для анализа ответа в роли учителя
-        prompt = f"""Ты - опытный преподаватель и наставник по QA/тестированию. Ученик отвечает на вопрос по материалу лекций.
+        user_data = user_manager.get_user_data(user_id)
+        selected_model = user_data.get("ai_model", "gemini-2.5-flash")
+        
+        # Если это первый ответ, создаем системный промпт
+        if len(conversation_history) == 1:
+            system_prompt = f"""Ты - опытный преподаватель и наставник по QA/тестированию. Ученик отвечает на вопрос по материалу лекций.
 
 Материал лекций:
 {lecture_content}
 
 Вопрос: {question}
-
-Ответ ученика: {answer}
 
 Твоя задача как учителя:
 1. Проанализировать ответ ученика
@@ -403,23 +452,32 @@ async def analyze_user_answer(message: Message, user_id: str, question: str, ans
 5. Быть доброжелательным и поддерживающим
 
 Формат ответа:
-- Начни с оценки ответа (хорошо/неплохо/нужно доработать)
+- Начни с оценки ответа (по 5 балльной шкале)
 - Дай конструктивную обратную связь
 - Если нужно - задай наводящий вопрос или дай подсказку
-- Заверши мотивирующей фразой
 
 Отвечай как опытный учитель, а не как строгий HR."""
-
+            
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": conversation_history[0]["content"]}
+            ]
+        else:
+            # Для продолжающегося диалога используем историю сообщений
+            messages = conversation_history.copy()
+        
         completion = client.chat.completions.create(
-            model="gemini-2.5-flash",
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
+            model=selected_model,
+            messages=messages,
             max_tokens=500,
             temperature=0.7
         )
         
         feedback = completion.choices[0].message.content.strip()
+        
+        # Добавляем ответ AI в историю диалога
+        conversation_history.append({"role": "assistant", "content": feedback})
+        await state.update_data(conversation_history=conversation_history)
         
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💬 Дополнить ответ", callback_data="continue_answer")],
